@@ -389,7 +389,7 @@ report_to:
 output_dir: $OUTPUT_DIR
 add_version: false
 save_only_model: false
-create_checkpoint_symlink: true
+create_checkpoint_symlink: false
 YAML
 
   if [[ -n "$RESUME_PATH" ]]; then

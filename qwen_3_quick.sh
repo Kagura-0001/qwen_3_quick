@@ -11,7 +11,9 @@ MODEL_ID="${MODEL_ID:-Qwen/Qwen3-0.6B}"
 MODEL_DIR="${MODEL_DIR:-$HOME/models/Qwen3-0.6B}"
 DATASET_ID="${DATASET_ID:-yahma/alpaca-cleaned}"
 DATASET_SPLIT="${DATASET_SPLIT:-train}"
-DATASET_PATH="${DATASET_PATH:-$BUNDLE_DIR/data/alpaca_cleaned/train.jsonl}"
+HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
+HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-$HF_HOME/datasets}"
+DATASET_PATH="${DATASET_PATH:-$HF_DATASETS_CACHE/qwen_3_quick/alpaca_cleaned/train.jsonl}"
 SYSTEM_PROMPT="${SYSTEM_PROMPT:-You are a helpful assistant.}"
 
 RUN_ID="${RUN_ID:-qwen3_quick_alpaca_lora_lowmem}"
@@ -25,12 +27,12 @@ AUTO_DATASET="${AUTO_DATASET:-1}"
 DRY_RUN="${DRY_RUN:-0}"
 PREPARE_ONLY="${PREPARE_ONLY:-0}"
 PROFILE="${PROFILE:-1}"
-RESUME="${RESUME:-1}"
-CLEAN_CHECKPOINTS_AFTER_SUCCESS="${CLEAN_CHECKPOINTS_AFTER_SUCCESS:-1}"
-FINAL_WEIGHT_DIR="${FINAL_WEIGHT_DIR:-$OUTPUT_DIR/final_weight}"
+RESUME="${RESUME:-0}"
 
 export PATH="$HOME/.local/bin:$HOME/bin:$PATH"
 export UV_LINK_MODE="${UV_LINK_MODE:-copy}"
+export HF_HOME
+export HF_DATASETS_CACHE
 
 usage() {
   cat <<'EOF'
@@ -42,19 +44,19 @@ Usage:
 Common overrides:
   PREPARE_ONLY=1 ./qwen_3_quick.sh        # install/download/convert only
   DRY_RUN=1 ./qwen_3_quick.sh             # generate config only
-  RESUME=1 ./qwen_3_quick.sh              # auto-resume from latest checkpoint
-  RESUME_FROM_CHECKPOINT=/path ./qwen_3_quick.sh
+  ./pause_qwen_3_quick.sh                 # stop training; next run starts over
 
 Default locations:
   ENV_DIR=~/.venv/qwen_3_quick
   MODEL_DIR=~/models/Qwen3-0.6B
-  DATASET_PATH=./data/alpaca_cleaned/train.jsonl
+  HF_DATASETS_CACHE=~/.cache/huggingface/datasets
+  DATASET_PATH=~/.cache/huggingface/datasets/qwen_3_quick/alpaca_cleaned/train.jsonl
   OUTPUT_DIR=./output/qwen3_quick_alpaca_lora_lowmem
 
 Training defaults:
   MAX_STEPS=100000000
-  SAVE_STEPS=1000
-  SAVE_TOTAL_LIMIT=2
+  SAVE_STRATEGY=steps
+  SAVE_STEPS=MAX_STEPS
   MAX_LENGTH=768
   BATCH_SIZE=1
   GRAD_ACC=1
@@ -62,8 +64,9 @@ Training defaults:
   NPROC_PER_NODE=8
 
 Notes:
-  Resume requires real checkpoints during training. Successful runs copy the
-  final adapter weights to FINAL_WEIGHT_DIR and remove checkpoint-* by default.
+  No intermediate checkpoint is saved by default. The last-step model-only save
+  is flattened into OUTPUT_DIR and checkpoint-* is removed. If paused, the next
+  run starts from scratch.
 EOF
 }
 
@@ -335,6 +338,8 @@ latest_checkpoint() {
 
 write_config() {
   mkdir -p "$OUTPUT_DIR" "$PROFILE_DIR" "$(dirname "$CONFIG_PATH")"
+  MAX_STEPS_VALUE="${MAX_STEPS:-100000000}"
+  SAVE_STEPS_VALUE="${SAVE_STEPS:-$MAX_STEPS_VALUE}"
 
   RESUME_PATH="${RESUME_FROM_CHECKPOINT:-}"
   if [[ "$RESUME" == "1" && -z "$RESUME_PATH" ]]; then
@@ -370,11 +375,11 @@ per_device_train_batch_size: ${BATCH_SIZE:-1}
 gradient_accumulation_steps: ${GRAD_ACC:-1}
 learning_rate: ${LEARNING_RATE:-2.0e-4}
 num_train_epochs: 1
-max_steps: ${MAX_STEPS:-100000000}
+max_steps: $MAX_STEPS_VALUE
 warmup_ratio: 0.03
 logging_steps: ${LOGGING_STEPS:-10}
 save_strategy: "${SAVE_STRATEGY:-steps}"
-save_steps: ${SAVE_STEPS:-1000}
+save_steps: $SAVE_STEPS_VALUE
 eval_steps: 100000
 save_total_limit: ${SAVE_TOTAL_LIMIT:-2}
 split_dataset_ratio: 0.0
@@ -388,7 +393,7 @@ report_to:
   - tensorboard
 output_dir: $OUTPUT_DIR
 add_version: false
-save_only_model: false
+save_only_model: ${SAVE_ONLY_MODEL:-true}
 create_checkpoint_symlink: false
 YAML
 
@@ -411,9 +416,9 @@ print_manifest() {
   echo "CONFIG_PATH: $CONFIG_PATH"
   echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
   echo "NPROC_PER_NODE: ${NPROC_PER_NODE:-8}"
-  echo "MAX_STEPS: ${MAX_STEPS:-100000000}"
-  echo "SAVE_STEPS: ${SAVE_STEPS:-1000}"
-  echo "SAVE_TOTAL_LIMIT: ${SAVE_TOTAL_LIMIT:-2}"
+  echo "MAX_STEPS: ${MAX_STEPS_VALUE:-${MAX_STEPS:-100000000}}"
+  echo "SAVE_STRATEGY: ${SAVE_STRATEGY:-steps}"
+  echo "SAVE_STEPS: ${SAVE_STEPS_VALUE:-${SAVE_STEPS:-${MAX_STEPS:-100000000}}}"
   if [[ -n "${RESUME_PATH:-}" ]]; then
     echo "RESUME_FROM_CHECKPOINT: $RESUME_PATH"
   else
@@ -455,7 +460,6 @@ run_train() {
 
   final_checkpoint="$(latest_checkpoint || true)"
   if [[ -n "$final_checkpoint" ]]; then
-    mkdir -p "$FINAL_WEIGHT_DIR"
     find "$final_checkpoint" -maxdepth 1 -type f \( \
       -name '*.safetensors' \
       -o -name '*.bin' \
@@ -467,13 +471,13 @@ run_train() {
       -o -name 'merges.txt' \
       -o -name 'args.json' \
       -o -name 'README.md' \
-    \) -exec cp -f {} "$FINAL_WEIGHT_DIR/" \;
-    echo "Final weights: $FINAL_WEIGHT_DIR"
+      -o -name 'training_args.bin' \
+    \) -exec cp -f {} "$OUTPUT_DIR/" \;
+    find "$OUTPUT_DIR" -maxdepth 1 -type d -name 'checkpoint-*' -print -exec rm -rf {} +
   fi
 
-  if [[ "$CLEAN_CHECKPOINTS_AFTER_SUCCESS" == "1" ]]; then
-    find "$OUTPUT_DIR" -maxdepth 1 -type d -name 'checkpoint-*' -print -exec rm -rf {} +
-    rm -f "$OUTPUT_DIR/last" "$OUTPUT_DIR/best"
+  if [[ -f "$OUTPUT_DIR/adapter_model.safetensors" || -f "$OUTPUT_DIR/model.safetensors" ]]; then
+    echo "Final weights: $OUTPUT_DIR"
   fi
 
   if [[ "$PROFILE" == "1" ]]; then

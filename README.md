@@ -1,16 +1,22 @@
 # qwen 3 quick
 
-Standalone one-file launcher for Qwen3-0.6B LoRA low-memory SFT.
+Standalone Qwen3-0.6B LoRA low-memory SFT launcher.
 
-The only public shell entrypoint is:
+Main training entrypoint:
 
 ```bash
 ./qwen_3_quick.sh
 ```
 
-It can install the env, download the model, download and convert a Hugging Face
-dataset, generate the Swift config, launch training, and resume after
-interruption.
+Stop a running training job:
+
+```bash
+./pause_qwen_3_quick.sh
+```
+
+The launcher can install the env, download the model, download and convert a
+Hugging Face dataset, generate the Swift config, and launch training. Paused
+runs are not resumed; the next launch starts from scratch.
 
 ## One-Click Run
 
@@ -24,9 +30,9 @@ Defaults:
 - Env: `~/.venv/qwen_3_quick`
 - Model: `~/models/Qwen3-0.6B`
 - Dataset: `yahma/alpaca-cleaned`
-- Converted JSONL: `./data/alpaca_cleaned/train.jsonl`
+- Converted JSONL: `~/.cache/huggingface/datasets/qwen_3_quick/alpaca_cleaned/train.jsonl`
 - Output: `./output/qwen3_quick_alpaca_lora_lowmem`
-- Final weights: `./output/qwen3_quick_alpaca_lora_lowmem/final_weight`
+- Final weights: `./output/qwen3_quick_alpaca_lora_lowmem`
 
 ## Training Defaults
 
@@ -40,39 +46,42 @@ Defaults:
 - batch size 1
 - gradient accumulation 1
 - `MAX_STEPS=100000000`
-- `SAVE_STEPS=1000`
-- `SAVE_TOTAL_LIMIT=2`
+- `SAVE_STRATEGY=steps`
+- `SAVE_STEPS=MAX_STEPS`
+- `SAVE_ONLY_MODEL=true`
 
-## Resume
+## Pause
 
-Resume is enabled by default:
+Pause means stop the current training process and release GPUs. It does not keep
+a resume checkpoint.
 
 ```bash
-RESUME=1 ./qwen_3_quick.sh
+./pause_qwen_3_quick.sh
 ```
 
-The script reuses the stable output dir and automatically picks the latest:
+If training uses a custom output directory, pass the same value:
 
 ```bash
-./output/qwen3_quick_alpaca_lora_lowmem/checkpoint-*
+OUTPUT_DIR=/path/to/output ./pause_qwen_3_quick.sh
 ```
 
-To resume from a specific checkpoint:
+The next run starts from scratch:
 
 ```bash
-RESUME_FROM_CHECKPOINT=/path/to/checkpoint-1000 ./qwen_3_quick.sh
+./qwen_3_quick.sh
 ```
 
-Training interruption cannot be resumed unless real checkpoint directories
-exist. For that reason the script saves resumable checkpoints during training.
-It keeps at most two by default. When a run finishes successfully, the latest
-weights are copied to `final_weight/`, and checkpoint directories are removed by
-default.
+## Checkpoints
 
-If you want to keep checkpoints after successful completion:
+Intermediate checkpoints are disabled by default. The launcher sets
+`SAVE_STEPS=MAX_STEPS`, so Swift only saves once at the final step. After a
+normal completed run, the launcher flattens the final LoRA weights into
+`OUTPUT_DIR` and removes `checkpoint-*`.
+
+If you explicitly want checkpoint/resume behavior, enable it manually:
 
 ```bash
-CLEAN_CHECKPOINTS_AFTER_SUCCESS=0 ./qwen_3_quick.sh
+SAVE_STEPS=1000 SAVE_ONLY_MODEL=false RESUME=1 ./qwen_3_quick.sh
 ```
 
 ## Common Overrides
@@ -82,13 +91,13 @@ ENV_DIR=~/.venv/qwen_3_quick
 MODEL_DIR=~/models/Qwen3-0.6B
 DATASET_ID=yahma/alpaca-cleaned
 DATASET_SPLIT=train
-DATASET_PATH=./data/alpaca_cleaned/train.jsonl
+HF_DATASETS_CACHE=~/.cache/huggingface/datasets
+DATASET_PATH=~/.cache/huggingface/datasets/qwen_3_quick/alpaca_cleaned/train.jsonl
 OUTPUT_DIR=./output/qwen3_quick_alpaca_lora_lowmem
 MAX_STEPS=100000000
-SAVE_STEPS=1000
-SAVE_TOTAL_LIMIT=2
-CLEAN_CHECKPOINTS_AFTER_SUCCESS=1
-FINAL_WEIGHT_DIR=./output/qwen3_quick_alpaca_lora_lowmem/final_weight
+SAVE_STRATEGY=steps
+SAVE_STEPS=100000000
+SAVE_ONLY_MODEL=true
 PROFILE=1
 ```
 
@@ -136,7 +145,13 @@ No profile summary script is included.
 Remove generated runtime outputs:
 
 ```bash
-rm -rf data output
+rm -rf output
+```
+
+Remove converted dataset:
+
+```bash
+rm -f ~/.cache/huggingface/datasets/qwen_3_quick/alpaca_cleaned/train.jsonl
 ```
 
 Remove the environment:

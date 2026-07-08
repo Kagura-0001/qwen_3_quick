@@ -1,6 +1,8 @@
 # qwen 3 quick
 
-Standalone Qwen3-0.6B LoRA low-memory SFT launcher.
+Standalone Qwen3 LoRA low-memory SFT launcher. The default path is tuned for
+8x H100 low memory with better SM utilization: Qwen3-4B + ZeRO-3 + bf16 +
+flash attention.
 
 Main training entrypoint:
 
@@ -28,17 +30,19 @@ cd /mnt/bn/strategy-mllm-train/intern/users/weisong/repo/omni/qwen_3_quick
 Defaults:
 
 - Env: `~/.venv/qwen_3_quick`
-- Model: `~/models/Qwen3-0.6B`
+- Model: `~/models/Qwen3-4B`
 - Dataset: `yahma/alpaca-cleaned`
 - Converted JSONL: `~/.cache/huggingface/datasets/qwen_3_quick/alpaca_cleaned/train.jsonl`
-- Output: `./output/qwen3_quick_alpaca_lora_lowmem`
-- Final weights: `./output/qwen3_quick_alpaca_lora_lowmem`
+- Output: `./output/qwen3_quick_4b_zero3_lora_lowmem`
+- Final weights: `./output/qwen3_quick_4b_zero3_lora_lowmem`
 
 ## Training Defaults
 
 - 8 GPUs: `CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7`
 - No TP
+- ZeRO-3: `DEEPSPEED=zero3`
 - LoRA all-linear
+- LoRA rank 8 / alpha 16
 - bf16
 - flash attention
 - gradient checkpointing
@@ -49,6 +53,41 @@ Defaults:
 - `SAVE_STRATEGY=steps`
 - `SAVE_STEPS=MAX_STEPS`
 - `SAVE_ONLY_MODEL=true`
+
+## Recommended Low-Memory High-SM Run
+
+This is the current recommended one-click run:
+
+```bash
+git clone https://github.com/Kagura-0001/qwen_3_quick.git
+cd qwen_3_quick
+./qwen_3_quick.sh
+```
+
+It downloads `Qwen/Qwen3-4B` to `~/models/Qwen3-4B` and trains with ZeRO-3.
+On this 8x H100 machine, the best valid candidates were:
+
+| Config | External peak | Active SM | Steps/s |
+| --- | ---: | ---: | ---: |
+| Qwen3-4B, ZeRO-3, length 512, batch 1, rank 8 | 7.23 GiB | 48.6% | 0.496 |
+| Qwen3-4B, ZeRO-3, length 768, batch 1, rank 8 | 8.66 GiB | 48.8% | 0.493 |
+| Qwen3-1.7B, DDP, length 768, batch 1, rank 8 | 9.43 GiB | 33.2% | 2.568 |
+
+Invalid boundary found: Qwen3-4B + ZeRO-3 + length 512 + batch 2 peaked at
+about 11.6 GiB on one GPU, so it does not satisfy a strict 10 GiB cap.
+
+Use the 0.6B DDP path explicitly if you need the older fast/small baseline:
+
+```bash
+MODEL_ID=Qwen/Qwen3-0.6B \
+MODEL_DIR=~/models/Qwen3-0.6B \
+DEEPSPEED= \
+LORA_RANK=32 \
+LORA_ALPHA=64 \
+RUN_ID=qwen3_quick_0p6b_lora_lowmem \
+OUTPUT_DIR=./output/qwen3_quick_0p6b_lora_lowmem \
+./qwen_3_quick.sh
+```
 
 ## Pause
 
@@ -88,12 +127,17 @@ SAVE_STEPS=1000 SAVE_ONLY_MODEL=false RESUME=1 ./qwen_3_quick.sh
 
 ```bash
 ENV_DIR=~/.venv/qwen_3_quick
-MODEL_DIR=~/models/Qwen3-0.6B
+MODEL_ID=Qwen/Qwen3-4B
+MODEL_DIR=~/models/Qwen3-4B
 DATASET_ID=yahma/alpaca-cleaned
 DATASET_SPLIT=train
 HF_DATASETS_CACHE=~/.cache/huggingface/datasets
 DATASET_PATH=~/.cache/huggingface/datasets/qwen_3_quick/alpaca_cleaned/train.jsonl
-OUTPUT_DIR=./output/qwen3_quick_alpaca_lora_lowmem
+RUN_ID=qwen3_quick_4b_zero3_lora_lowmem
+OUTPUT_DIR=./output/qwen3_quick_4b_zero3_lora_lowmem
+DEEPSPEED=zero3
+LORA_RANK=8
+LORA_ALPHA=16
 MAX_STEPS=100000000
 SAVE_STRATEGY=steps
 SAVE_STEPS=100000000

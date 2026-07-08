@@ -7,8 +7,8 @@ BUNDLE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_DIR="${ENV_DIR:-$HOME/.venv/qwen_3_quick}"
 PYTHON_BIN="${PYTHON_BIN:-$ENV_DIR/bin/python}"
 SWIFT_BIN="${SWIFT_BIN:-$ENV_DIR/bin/swift}"
-MODEL_ID="${MODEL_ID:-Qwen/Qwen3-0.6B}"
-MODEL_DIR="${MODEL_DIR:-$HOME/models/Qwen3-0.6B}"
+MODEL_ID="${MODEL_ID:-Qwen/Qwen3-4B}"
+MODEL_DIR="${MODEL_DIR:-$HOME/models/Qwen3-4B}"
 DATASET_ID="${DATASET_ID:-yahma/alpaca-cleaned}"
 DATASET_SPLIT="${DATASET_SPLIT:-train}"
 HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
@@ -16,7 +16,7 @@ HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-$HF_HOME/datasets}"
 DATASET_PATH="${DATASET_PATH:-$HF_DATASETS_CACHE/qwen_3_quick/alpaca_cleaned/train.jsonl}"
 SYSTEM_PROMPT="${SYSTEM_PROMPT:-You are a helpful assistant.}"
 
-RUN_ID="${RUN_ID:-qwen3_quick_alpaca_lora_lowmem}"
+RUN_ID="${RUN_ID:-qwen3_quick_4b_zero3_lora_lowmem}"
 OUTPUT_DIR="${OUTPUT_DIR:-$BUNDLE_DIR/output/$RUN_ID}"
 PROFILE_DIR="${PROFILE_DIR:-$BUNDLE_DIR/output/gpu_profiles}"
 CONFIG_PATH="${CONFIG_PATH:-${TMPDIR:-/tmp}/${RUN_ID}.yaml}"
@@ -28,6 +28,7 @@ DRY_RUN="${DRY_RUN:-0}"
 PREPARE_ONLY="${PREPARE_ONLY:-0}"
 PROFILE="${PROFILE:-1}"
 RESUME="${RESUME:-0}"
+DEEPSPEED="${DEEPSPEED-zero3}"
 
 export PATH="$HOME/.local/bin:$HOME/bin:$PATH"
 export UV_LINK_MODE="${UV_LINK_MODE:-copy}"
@@ -48,10 +49,10 @@ Common overrides:
 
 Default locations:
   ENV_DIR=~/.venv/qwen_3_quick
-  MODEL_DIR=~/models/Qwen3-0.6B
+  MODEL_DIR=~/models/Qwen3-4B
   HF_DATASETS_CACHE=~/.cache/huggingface/datasets
   DATASET_PATH=~/.cache/huggingface/datasets/qwen_3_quick/alpaca_cleaned/train.jsonl
-  OUTPUT_DIR=./output/qwen3_quick_alpaca_lora_lowmem
+  OUTPUT_DIR=./output/qwen3_quick_4b_zero3_lora_lowmem
 
 Training defaults:
   MAX_STEPS=100000000
@@ -62,6 +63,10 @@ Training defaults:
   GRAD_ACC=1
   CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
   NPROC_PER_NODE=8
+  DEEPSPEED=zero3                         # set DEEPSPEED= to disable
+  LORA_RANK=8
+  LORA_ALPHA=16
+  TARGET_MODULES=all-linear               # comma-separated LoRA target modules
 
 Notes:
   No intermediate checkpoint is saved by default. The last-step model-only save
@@ -212,7 +217,9 @@ find_hf_bin() {
 
 ensure_model() {
   mkdir -p "$MODEL_DIR"
-  if [[ -f "$MODEL_DIR/config.json" && -f "$MODEL_DIR/model.safetensors" && "${FORCE_MODEL_DOWNLOAD:-0}" != "1" ]]; then
+  if [[ -f "$MODEL_DIR/config.json" \
+      && ( -f "$MODEL_DIR/model.safetensors" || -f "$MODEL_DIR/model.safetensors.index.json" ) \
+      && "${FORCE_MODEL_DOWNLOAD:-0}" != "1" ]]; then
     echo "Model ready: $MODEL_DIR"
     return
   fi
@@ -357,9 +364,20 @@ columns:
 tuner_type: lora
 tuner_backend: peft
 target_modules:
-  - all-linear
-lora_rank: ${LORA_RANK:-32}
-lora_alpha: ${LORA_ALPHA:-64}
+YAML
+
+  OLD_IFS="$IFS"
+  IFS=',' read -r -a TARGET_MODULE_ARRAY <<<"${TARGET_MODULES:-all-linear}"
+  IFS="$OLD_IFS"
+  for module in "${TARGET_MODULE_ARRAY[@]}"; do
+    module="${module#"${module%%[![:space:]]*}"}"
+    module="${module%"${module##*[![:space:]]}"}"
+    [[ -n "$module" ]] && printf '  - %s\n' "$module" >>"$CONFIG_PATH"
+  done
+
+  cat >>"$CONFIG_PATH" <<YAML
+lora_rank: ${LORA_RANK:-8}
+lora_alpha: ${LORA_ALPHA:-16}
 lora_dropout: 0.0
 torch_dtype: bfloat16
 bf16: true
@@ -397,6 +415,12 @@ save_only_model: ${SAVE_ONLY_MODEL:-true}
 create_checkpoint_symlink: false
 YAML
 
+  if [[ -n "${DEEPSPEED:-}" ]]; then
+    cat >>"$CONFIG_PATH" <<YAML
+deepspeed: $DEEPSPEED
+YAML
+  fi
+
   if [[ -n "$RESUME_PATH" ]]; then
     cat >>"$CONFIG_PATH" <<YAML
 resume_from_checkpoint: $RESUME_PATH
@@ -416,6 +440,10 @@ print_manifest() {
   echo "CONFIG_PATH: $CONFIG_PATH"
   echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
   echo "NPROC_PER_NODE: ${NPROC_PER_NODE:-8}"
+  echo "DEEPSPEED: ${DEEPSPEED:-<disabled>}"
+  echo "TARGET_MODULES: ${TARGET_MODULES:-all-linear}"
+  echo "LORA_RANK: ${LORA_RANK:-8}"
+  echo "LORA_ALPHA: ${LORA_ALPHA:-16}"
   echo "MAX_STEPS: ${MAX_STEPS_VALUE:-${MAX_STEPS:-100000000}}"
   echo "SAVE_STRATEGY: ${SAVE_STRATEGY:-steps}"
   echo "SAVE_STEPS: ${SAVE_STEPS_VALUE:-${SAVE_STEPS:-${MAX_STEPS:-100000000}}}"

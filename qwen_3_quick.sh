@@ -16,7 +16,7 @@ HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-$HF_HOME/datasets}"
 DATASET_PATH="${DATASET_PATH:-$HF_DATASETS_CACHE/qwen_3_quick/alpaca_cleaned/train.jsonl}"
 SYSTEM_PROMPT="${SYSTEM_PROMPT:-You are a helpful assistant.}"
 
-RUN_ID="${RUN_ID:-qwen3_quick_4b_zero3_lora_lowmem}"
+RUN_ID="${RUN_ID:-qwen3_quick_4b_ddp_lora_b8_l1024_flash}"
 OUTPUT_DIR="${OUTPUT_DIR:-$BUNDLE_DIR/output/$RUN_ID}"
 PROFILE_DIR="${PROFILE_DIR:-$BUNDLE_DIR/output/gpu_profiles}"
 CONFIG_PATH="${CONFIG_PATH:-${TMPDIR:-/tmp}/${RUN_ID}.yaml}"
@@ -28,7 +28,17 @@ DRY_RUN="${DRY_RUN:-0}"
 PREPARE_ONLY="${PREPARE_ONLY:-0}"
 PROFILE="${PROFILE:-1}"
 RESUME="${RESUME:-0}"
-DEEPSPEED="${DEEPSPEED-zero3}"
+DEEPSPEED="${DEEPSPEED-}"
+TORCH_VERSION="${TORCH_VERSION:-2.8.0}"
+TORCHVISION_VERSION="${TORCHVISION_VERSION:-0.23.0}"
+TORCHAUDIO_VERSION="${TORCHAUDIO_VERSION:-$TORCH_VERSION}"
+PYTORCH_CUDA="${PYTORCH_CUDA:-cu128}"
+FLASH_ATTN_VERSION="${FLASH_ATTN_VERSION:-2.8.3}"
+FLASH_ATTN_RELEASE_TAG="${FLASH_ATTN_RELEASE_TAG:-v$FLASH_ATTN_VERSION}"
+FLASH_ATTN_REPO="${FLASH_ATTN_REPO:-Dao-AILab/flash-attention}"
+FLASH_ATTN_WHEEL="${FLASH_ATTN_WHEEL:-}"
+FLASH_ATTN_INSTALL="${FLASH_ATTN_INSTALL:-wheel}"
+REQUIRE_FLASH_ATTN="${REQUIRE_FLASH_ATTN:-1}"
 
 export PATH="$HOME/.local/bin:$HOME/bin:$PATH"
 export UV_LINK_MODE="${UV_LINK_MODE:-copy}"
@@ -52,18 +62,18 @@ Default locations:
   MODEL_DIR=~/models/Qwen3-4B
   HF_DATASETS_CACHE=~/.cache/huggingface/datasets
   DATASET_PATH=~/.cache/huggingface/datasets/qwen_3_quick/alpaca_cleaned/train.jsonl
-  OUTPUT_DIR=./output/qwen3_quick_4b_zero3_lora_lowmem
+  OUTPUT_DIR=./output/qwen3_quick_4b_ddp_lora_b8_l1024_flash
 
 Training defaults:
   MAX_STEPS=100000000
   SAVE_STRATEGY=steps
   SAVE_STEPS=MAX_STEPS
-  MAX_LENGTH=768
-  BATCH_SIZE=1
+  MAX_LENGTH=1024
+  BATCH_SIZE=8
   GRAD_ACC=1
   CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
   NPROC_PER_NODE=8
-  DEEPSPEED=zero3                         # set DEEPSPEED= to disable
+  DEEPSPEED=                              # set DEEPSPEED=zero3 for ZeRO-3
   LORA_RANK=8
   LORA_ALPHA=16
   TARGET_MODULES=all-linear               # comma-separated LoRA target modules
@@ -118,8 +128,31 @@ ensure_uv() {
   }
 }
 
+env_matches_requirements() {
+  [[ -x "$PYTHON_BIN" && -x "$SWIFT_BIN" ]] || return 1
+  "$PYTHON_BIN" - "$TORCH_VERSION" "$PYTORCH_CUDA" "$REQUIRE_FLASH_ATTN" <<'PY' >/dev/null 2>&1
+import sys
+
+torch_version, pytorch_cuda, require_flash_attn = sys.argv[1:]
+
+import torch
+import swift  # noqa: F401
+
+if torch.__version__.split("+", 1)[0] != torch_version:
+    raise SystemExit(1)
+
+cuda_version = torch.version.cuda or ""
+cuda_tag = "cu" + cuda_version.replace(".", "")
+if cuda_tag != pytorch_cuda:
+    raise SystemExit(1)
+
+if require_flash_attn == "1":
+    import flash_attn  # noqa: F401
+PY
+}
+
 ensure_env() {
-  if [[ -x "$PYTHON_BIN" && -x "$SWIFT_BIN" && "${FORCE_ENV_INSTALL:-0}" != "1" ]]; then
+  if [[ "${FORCE_ENV_INSTALL:-0}" != "1" ]] && env_matches_requirements; then
     echo "Env ready: $ENV_DIR"
     return
   fi
@@ -134,12 +167,12 @@ ensure_env() {
   echo "Installing build helpers"
   uv_cmd pip install -U pip setuptools wheel packaging ninja
 
-  echo "Installing PyTorch CUDA 12.9 stack"
+  echo "Installing PyTorch $TORCH_VERSION $PYTORCH_CUDA stack"
   uv_cmd pip install \
-    --index-url https://download.pytorch.org/whl/cu129 \
-    torch==2.11.0 \
-    torchvision==0.26.0 \
-    torchaudio==2.11.0
+    --index-url "https://download.pytorch.org/whl/$PYTORCH_CUDA" \
+    "torch==$TORCH_VERSION" \
+    "torchvision==$TORCHVISION_VERSION" \
+    "torchaudio==$TORCHAUDIO_VERSION"
 
   echo "Installing ms-swift and Qwen SFT dependencies"
   uv_cmd pip install \
@@ -171,8 +204,7 @@ ensure_env() {
   export MAX_JOBS="${MAX_JOBS:-32}"
 
   if [[ "${SKIP_FLASH_ATTN:-0}" != "1" ]]; then
-    echo "Installing flash-attn"
-    uv_cmd pip install --no-build-isolation "flash-attn==2.8.3"
+    install_flash_attn
   else
     echo "Skipping flash-attn because SKIP_FLASH_ATTN=1"
   fi
@@ -180,6 +212,7 @@ ensure_env() {
   echo "Sanity checking env"
   env -u LD_LIBRARY_PATH "$PYTHON_BIN" - <<'PY'
 import importlib.metadata as metadata
+import os
 import torch
 import swift
 import transformers
@@ -195,8 +228,71 @@ try:
     print("flash-attn", flash_attn.__version__)
 except Exception as exc:
     print("flash-attn import failed:", repr(exc))
+    if os.environ.get("REQUIRE_FLASH_ATTN", "1") == "1":
+        raise SystemExit(1)
 print("huggingface-hub", metadata.version("huggingface-hub"))
 PY
+}
+
+detect_flash_attn_wheel() {
+  if [[ -n "$FLASH_ATTN_WHEEL" ]]; then
+    echo "$FLASH_ATTN_WHEEL"
+    return
+  fi
+
+  "$PYTHON_BIN" - "$FLASH_ATTN_VERSION" "$FLASH_ATTN_RELEASE_TAG" "$FLASH_ATTN_REPO" <<'PY'
+import platform
+import sys
+from urllib.parse import quote
+
+import torch
+
+version, release_tag, repo = sys.argv[1:]
+python_tag = f"cp{sys.version_info.major}{sys.version_info.minor}"
+torch_version = torch.__version__.split("+", 1)[0]
+torch_mm = ".".join(torch_version.split(".")[:2])
+cuda_version = torch.version.cuda or ""
+if not cuda_version:
+    raise SystemExit("cannot choose a flash-attn wheel because torch.version.cuda is empty")
+cuda_major = cuda_version.split(".", 1)[0]
+cuda_tag = f"cu{cuda_major}"
+abi = "TRUE" if torch._C._GLIBCXX_USE_CXX11_ABI else "FALSE"
+machine = platform.machine()
+if machine not in {"x86_64", "aarch64"}:
+    raise SystemExit(f"unsupported machine for flash-attn wheel auto-detection: {machine}")
+platform_tag = f"linux_{machine}"
+name = (
+    f"flash_attn-{version}+{cuda_tag}torch{torch_mm}"
+    f"cxx11abi{abi}-{python_tag}-{python_tag}-{platform_tag}.whl"
+)
+encoded = quote(name, safe="")
+print(f"https://github.com/{repo}/releases/download/{release_tag}/{encoded}")
+PY
+}
+
+install_flash_attn() {
+  if [[ "$FLASH_ATTN_INSTALL" == "source" ]]; then
+    echo "Installing flash-attn from source because FLASH_ATTN_INSTALL=source"
+    uv_cmd pip install --no-build-isolation "flash-attn==$FLASH_ATTN_VERSION"
+    return
+  fi
+
+  local wheel
+  wheel="$(detect_flash_attn_wheel)"
+  echo "Installing flash-attn wheel: $wheel"
+  if ! uv_cmd pip install --no-deps --only-binary=:all: "$wheel"; then
+    cat >&2 <<EOF
+Failed to install a prebuilt flash-attn wheel.
+
+Current defaults intentionally avoid local compilation. Provide a compatible
+wheel with:
+
+  FLASH_ATTN_WHEEL=/path/to/flash_attn-*.whl ./qwen_3_quick.sh
+
+or set FLASH_ATTN_INSTALL=source if you explicitly want to compile.
+EOF
+    exit 2
+  fi
 }
 
 find_hf_bin() {
@@ -385,11 +481,11 @@ attn_impl: flash_attn
 gradient_checkpointing: true
 use_logits_to_keep: true
 packing: true
-packing_length: ${MAX_LENGTH:-768}
+packing_length: ${MAX_LENGTH:-1024}
 packing_num_proc: 8
 lazy_tokenize: false
-max_length: ${MAX_LENGTH:-768}
-per_device_train_batch_size: ${BATCH_SIZE:-1}
+max_length: ${MAX_LENGTH:-1024}
+per_device_train_batch_size: ${BATCH_SIZE:-8}
 gradient_accumulation_steps: ${GRAD_ACC:-1}
 learning_rate: ${LEARNING_RATE:-2.0e-4}
 num_train_epochs: 1
@@ -454,6 +550,62 @@ print_manifest() {
   fi
 }
 
+summarize_profile() {
+  local gpu_csv="$1"
+  local dmon_log="$2"
+
+  if [[ -s "$dmon_log" ]]; then
+    awk '
+      !/^#/ && NF >= 17 {
+        sm = $7 + 0
+        sum += sm
+        n += 1
+        if (sm > 0) {
+          active_sum += sm
+          active_n += 1
+        }
+      }
+      END {
+        if (n > 0) {
+          printf "SM avg: %.2f%% all samples", sum / n
+          if (active_n > 0) {
+            printf ", %.2f%% nonzero samples", active_sum / active_n
+          }
+          printf "\n"
+        }
+      }
+    ' "$dmon_log"
+  fi
+
+  if [[ -s "$gpu_csv" ]]; then
+    awk -F, '
+      {
+        util = $3 + 0
+        mem = $4 + 0
+        sum += util
+        n += 1
+        if (util > 0) {
+          active_sum += util
+          active_n += 1
+        }
+        if (mem > max_mem) {
+          max_mem = mem
+        }
+      }
+      END {
+        if (n > 0) {
+          printf "GPU util avg: %.2f%% all samples", sum / n
+          if (active_n > 0) {
+            printf ", %.2f%% nonzero samples", active_sum / active_n
+          }
+          printf "\n"
+          printf "GPU memory max: %.2f GiB\n", max_mem / 1024
+        }
+      }
+    ' "$gpu_csv"
+  fi
+}
+
 run_train() {
   GPU_CSV="$PROFILE_DIR/${RUN_ID}_$(date +%Y%m%d_%H%M%S)_nvidia_smi.csv"
   DMON_LOG="$PROFILE_DIR/${RUN_ID}_$(date +%Y%m%d_%H%M%S)_dmon.log"
@@ -511,6 +663,7 @@ run_train() {
   if [[ "$PROFILE" == "1" ]]; then
     echo "GPU CSV: $GPU_CSV"
     echo "SM dmon: $DMON_LOG"
+    summarize_profile "$GPU_CSV" "$DMON_LOG"
   fi
 }
 

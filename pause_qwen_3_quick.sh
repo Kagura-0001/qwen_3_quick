@@ -3,7 +3,7 @@
 set -euo pipefail
 
 BUNDLE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RUN_ID="${RUN_ID:-qwen3_quick_4b_zero3_lora_lowmem}"
+RUN_ID="${RUN_ID:-qwen3_quick_4b_ddp_lora_b8_l1024_flash}"
 OUTPUT_DIR="${OUTPUT_DIR:-$BUNDLE_DIR/output/$RUN_ID}"
 CONFIG_PATH="${CONFIG_PATH:-${TMPDIR:-/tmp}/${RUN_ID}.yaml}"
 WAIT_SECONDS="${WAIT_SECONDS:-30}"

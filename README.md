@@ -1,8 +1,11 @@
 # qwen 3 quick
 
-Standalone Qwen3 LoRA low-memory SFT launcher. The default path is tuned for
-8x H100 low memory with better SM utilization: Qwen3-4B + ZeRO-3 + bf16 +
-flash attention.
+Standalone Qwen3 LoRA SFT launcher. The default path is tuned for 8x H100
+utilization: Qwen3-4B + DDP + bf16 + flash attention.
+
+The environment path installs flash-attn from a prebuilt wheel by default. It
+does not compile flash-attn locally unless `FLASH_ATTN_INSTALL=source` is set
+explicitly.
 
 Main training entrypoint:
 
@@ -33,28 +36,30 @@ Defaults:
 - Model: `~/models/Qwen3-4B`
 - Dataset: `yahma/alpaca-cleaned`
 - Converted JSONL: `~/.cache/huggingface/datasets/qwen_3_quick/alpaca_cleaned/train.jsonl`
-- Output: `./output/qwen3_quick_4b_zero3_lora_lowmem`
-- Final weights: `./output/qwen3_quick_4b_zero3_lora_lowmem`
+- Output: `./output/qwen3_quick_4b_ddp_lora_b8_l1024_flash`
+- Final weights: `./output/qwen3_quick_4b_ddp_lora_b8_l1024_flash`
 
 ## Training Defaults
 
 - 8 GPUs: `CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7`
 - No TP
-- ZeRO-3: `DEEPSPEED=zero3`
+- DDP: `DEEPSPEED=`; set `DEEPSPEED=zero3` for the low-memory path
+- PyTorch 2.8.0 + CUDA 12.8 wheels
+- flash-attn 2.8.3 official prebuilt wheel
 - LoRA all-linear
 - LoRA rank 8 / alpha 16
 - bf16
 - flash attention
 - gradient checkpointing
-- max length 768
-- batch size 1
+- max length 1024
+- batch size 8
 - gradient accumulation 1
 - `MAX_STEPS=100000000`
 - `SAVE_STRATEGY=steps`
 - `SAVE_STEPS=MAX_STEPS`
 - `SAVE_ONLY_MODEL=true`
 
-## Recommended Low-Memory High-SM Run
+## Recommended High-Utilization Run
 
 This is the current recommended one-click run:
 
@@ -64,17 +69,17 @@ cd qwen_3_quick
 ./qwen_3_quick.sh
 ```
 
-It downloads `Qwen/Qwen3-4B` to `~/models/Qwen3-4B` and trains with ZeRO-3.
-On this 8x H100 machine, the best valid candidates were:
+It downloads `Qwen/Qwen3-4B` to `~/models/Qwen3-4B` and trains with DDP.
+On this 8x H100 machine, the best current candidate is:
 
-| Config | External peak | Active SM | Steps/s |
-| --- | ---: | ---: | ---: |
-| Qwen3-4B, ZeRO-3, length 512, batch 1, rank 8 | 7.23 GiB | 48.6% | 0.496 |
-| Qwen3-4B, ZeRO-3, length 768, batch 1, rank 8 | 8.66 GiB | 48.8% | 0.493 |
-| Qwen3-1.7B, DDP, length 768, batch 1, rank 8 | 9.43 GiB | 33.2% | 2.568 |
+| Config | Peak memory | SM avg | GPU util avg | Steps/s |
+| --- | ---: | ---: | ---: | ---: |
+| Qwen3-4B, DDP, length 1024, batch 8, rank 8 | 73.3 GiB | 90.2% active / 80.6% all | 90.3% active / 81.0% all | 0.974 |
+| Qwen3-4B, ZeRO-3, length 1024, batch 4, rank 8 | 41.8 GiB | 69.6% active / 49.9% all | 66.6% active / 48.1% all | 0.583 |
 
-Invalid boundary found: Qwen3-4B + ZeRO-3 + length 512 + batch 2 peaked at
-about 11.6 GiB on one GPU, so it does not satisfy a strict 10 GiB cap.
+The launcher starts GPU monitors before model loading, so short smoke tests
+include startup and shutdown 0% samples. For long training runs, the all-sample
+average converges toward the active training average as startup is amortized.
 
 Use the 0.6B DDP path explicitly if you need the older fast/small baseline:
 
@@ -127,17 +132,26 @@ SAVE_STEPS=1000 SAVE_ONLY_MODEL=false RESUME=1 ./qwen_3_quick.sh
 
 ```bash
 ENV_DIR=~/.venv/qwen_3_quick
+TORCH_VERSION=2.8.0
+TORCHVISION_VERSION=0.23.0
+TORCHAUDIO_VERSION=2.8.0
+PYTORCH_CUDA=cu128
+FLASH_ATTN_VERSION=2.8.3
+FLASH_ATTN_WHEEL=                    # optional local wheel path or URL
+FLASH_ATTN_INSTALL=wheel             # wheel by default; source only if explicit
 MODEL_ID=Qwen/Qwen3-4B
 MODEL_DIR=~/models/Qwen3-4B
 DATASET_ID=yahma/alpaca-cleaned
 DATASET_SPLIT=train
 HF_DATASETS_CACHE=~/.cache/huggingface/datasets
 DATASET_PATH=~/.cache/huggingface/datasets/qwen_3_quick/alpaca_cleaned/train.jsonl
-RUN_ID=qwen3_quick_4b_zero3_lora_lowmem
-OUTPUT_DIR=./output/qwen3_quick_4b_zero3_lora_lowmem
-DEEPSPEED=zero3
+RUN_ID=qwen3_quick_4b_ddp_lora_b8_l1024_flash
+OUTPUT_DIR=./output/qwen3_quick_4b_ddp_lora_b8_l1024_flash
+DEEPSPEED=
 LORA_RANK=8
 LORA_ALPHA=16
+MAX_LENGTH=1024
+BATCH_SIZE=8
 MAX_STEPS=100000000
 SAVE_STRATEGY=steps
 SAVE_STEPS=100000000
